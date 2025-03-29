@@ -219,7 +219,9 @@ func (s *DoHNameServer) sendQuery(ctx context.Context, domain string, clientIP n
 		return
 	}
 
-	reqs := buildReqMsgs(domain, option, s.newReqID, genEDNS0Options(clientIP))
+	// As we don't want our traffic pattern looks like DoH, we use Random-Length Padding instead of Block-Length Padding recommended in RFC 8467
+	// Although DoH server like 1.1.1.1 will pad the response to Block-Length 468, at least it is better than no padding for response at all
+	reqs := buildReqMsgs(domain, option, s.newReqID, genEDNS0Options(clientIP, int(crypto.RandBetween(100, 300))))
 
 	var deadline time.Time
 	if d, ok := ctx.Deadline(); ok {
@@ -299,64 +301,66 @@ func (s *DoHNameServer) dohHTTPSContext(ctx context.Context, b []byte) ([]byte, 
 	return io.ReadAll(resp.Body)
 }
 
-func (s *DoHNameServer) findIPsForDomain(domain string, option dns_feature.IPOption) ([]net.IP, error) {
+func (s *DoHNameServer) findIPsForDomain(domain string, option dns_feature.IPOption) ([]net.IP, uint32, error) {
 	s.RLock()
 	record, found := s.ips[domain]
 	s.RUnlock()
 
 	if !found {
-		return nil, errRecordNotFound
+		return nil, 0, errRecordNotFound
 	}
 
 	var err4 error
 	var err6 error
 	var ips []net.Address
 	var ip6 []net.Address
+	var ttl uint32
 
 	if option.IPv4Enable {
-		ips, err4 = record.A.getIPs()
+		ips, ttl, err4 = record.A.getIPs()
 	}
 
 	if option.IPv6Enable {
-		ip6, err6 = record.AAAA.getIPs()
+		ip6, ttl, err6 = record.AAAA.getIPs()
 		ips = append(ips, ip6...)
 	}
 
 	if len(ips) > 0 {
-		return toNetIP(ips)
+		netips, err := toNetIP(ips)
+		return netips, ttl, err
 	}
 
 	if err4 != nil {
-		return nil, err4
+		return nil, 0, err4
 	}
 
 	if err6 != nil {
-		return nil, err6
+		return nil, 0, err6
 	}
 
 	if (option.IPv4Enable && record.A != nil) || (option.IPv6Enable && record.AAAA != nil) {
-		return nil, dns_feature.ErrEmptyResponse
+		return nil, 0, dns_feature.ErrEmptyResponse
 	}
 
-	return nil, errRecordNotFound
+	return nil, 0, errRecordNotFound
 }
 
 // QueryIP implements Server.
-func (s *DoHNameServer) QueryIP(ctx context.Context, domain string, clientIP net.IP, option dns_feature.IPOption, disableCache bool) ([]net.IP, error) { // nolint: dupl
+func (s *DoHNameServer) QueryIP(ctx context.Context, domain string, clientIP net.IP, option dns_feature.IPOption, disableCache bool) ([]net.IP, uint32, error) { // nolint: dupl
 	fqdn := Fqdn(domain)
 	option = ResolveIpOptionOverride(s.queryStrategy, option)
 	if !option.IPv4Enable && !option.IPv6Enable {
-		return nil, dns_feature.ErrEmptyResponse
+		return nil, 0, dns_feature.ErrEmptyResponse
 	}
 
 	if disableCache {
 		errors.LogDebug(ctx, "DNS cache is disabled. Querying IP for ", domain, " at ", s.name)
 	} else {
-		ips, err := s.findIPsForDomain(fqdn, option)
-		if err == nil || err == dns_feature.ErrEmptyResponse {
+		ips, ttl, err := s.findIPsForDomain(fqdn, option)
+		if err == nil || err == dns_feature.ErrEmptyResponse || dns_feature.RCodeFromError(err) == 3 {
 			errors.LogDebugInner(ctx, err, s.name, " cache HIT ", domain, " -> ", ips)
 			log.Record(&log.DNSLog{Server: s.name, Domain: domain, Result: ips, Status: log.DNSCacheHit, Elapsed: 0, Error: err})
-			return ips, err
+			return ips, ttl, err
 		}
 	}
 
@@ -390,15 +394,15 @@ func (s *DoHNameServer) QueryIP(ctx context.Context, domain string, clientIP net
 	start := time.Now()
 
 	for {
-		ips, err := s.findIPsForDomain(fqdn, option)
+		ips, ttl, err := s.findIPsForDomain(fqdn, option)
 		if err != errRecordNotFound {
 			log.Record(&log.DNSLog{Server: s.name, Domain: domain, Result: ips, Status: log.DNSQueried, Elapsed: time.Since(start), Error: err})
-			return ips, err
+			return ips, ttl, err
 		}
 
 		select {
 		case <-ctx.Done():
-			return nil, ctx.Err()
+			return nil, 0, ctx.Err()
 		case <-done:
 		}
 	}
