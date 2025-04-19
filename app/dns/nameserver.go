@@ -9,6 +9,7 @@ import (
 	"github.com/xtls/xray-core/app/router"
 	"github.com/xtls/xray-core/common/errors"
 	"github.com/xtls/xray-core/common/net"
+	"github.com/xtls/xray-core/common/session"
 	"github.com/xtls/xray-core/common/strmatcher"
 	"github.com/xtls/xray-core/core"
 	"github.com/xtls/xray-core/features/dns"
@@ -20,19 +21,22 @@ type Server interface {
 	// Name of the Client.
 	Name() string
 	// QueryIP sends IP queries to its configured server.
-	QueryIP(ctx context.Context, domain string, clientIP net.IP, option dns.IPOption, disableCache bool) ([]net.IP, error)
+	QueryIP(ctx context.Context, domain string, clientIP net.IP, option dns.IPOption, disableCache bool) ([]net.IP, uint32, error)
 }
 
 // Client is the interface for DNS client.
 type Client struct {
-	server       Server
-	clientIP     net.IP
-	skipFallback bool
-	domains      []string
-	expectIPs    []*router.GeoIPMatcher
+	server             Server
+	clientIP           net.IP
+	skipFallback       bool
+	domains            []string
+	expectedIPs        []*router.GeoIPMatcher
+	allowUnexpectedIPs bool
+	tag                string
+	timeoutMs          time.Duration
 }
 
-var errExpectedIPNonMatch = errors.New("expectIPs not match")
+var errExpectedIPNonMatch = errors.New("expectedIPs not match")
 
 // NewServer creates a name server object according to the network destination url.
 func NewServer(ctx context.Context, dest net.Destination, dispatcher routing.Dispatcher, queryStrategy QueryStrategy) (Server, error) {
@@ -161,11 +165,19 @@ func NewClient(
 			}
 		}
 
+		var timeoutMs = 4000 * time.Millisecond
+		if ns.TimeoutMs > 0 {
+			timeoutMs = time.Duration(ns.TimeoutMs) * time.Millisecond
+		}
+		
 		client.server = server
 		client.clientIP = clientIP
 		client.skipFallback = ns.SkipFallback
 		client.domains = rules
-		client.expectIPs = matchers
+		client.expectedIPs = matchers
+		client.allowUnexpectedIPs = ns.AllowUnexpectedIPs
+		client.tag = ns.Tag
+		client.timeoutMs = timeoutMs
 		return nil
 	})
 	return client, err
@@ -177,25 +189,33 @@ func (c *Client) Name() string {
 }
 
 // QueryIP sends DNS query to the name server with the client's IP.
-func (c *Client) QueryIP(ctx context.Context, domain string, option dns.IPOption, disableCache bool) ([]net.IP, error) {
-	ctx, cancel := context.WithTimeout(ctx, 4*time.Second)
-	ips, err := c.server.QueryIP(ctx, domain, c.clientIP, option, disableCache)
+func (c *Client) QueryIP(ctx context.Context, domain string, option dns.IPOption, disableCache bool) ([]net.IP, uint32, error) {
+	ctx, cancel := context.WithTimeout(ctx, c.timeoutMs)
+	if len(c.tag) != 0 {
+		content := session.InboundFromContext(ctx)
+		errors.LogDebug(ctx, "DNS: client override tag from ", content.Tag, " to ", c.tag)
+		// create a new context to override the tag
+		// do not direct set *content.Tag, it might be used by other clients
+		ctx = session.ContextWithInbound(ctx, &session.Inbound{Tag: c.tag})
+	}
+	ips, ttl, err := c.server.QueryIP(ctx, domain, c.clientIP, option, disableCache)
 	cancel()
 
 	if err != nil {
-		return ips, err
+		return ips, ttl, err
 	}
-	return c.MatchExpectedIPs(domain, ips)
+	netips, err := c.MatchExpectedIPs(domain, ips)
+	return netips, ttl, err
 }
 
 // MatchExpectedIPs matches queried domain IPs with expected IPs and returns matched ones.
 func (c *Client) MatchExpectedIPs(domain string, ips []net.IP) ([]net.IP, error) {
-	if len(c.expectIPs) == 0 {
+	if len(c.expectedIPs) == 0 {
 		return ips, nil
 	}
 	newIps := []net.IP{}
 	for _, ip := range ips {
-		for _, matcher := range c.expectIPs {
+		for _, matcher := range c.expectedIPs {
 			if matcher.Match(ip) {
 				newIps = append(newIps, ip)
 				break
@@ -203,9 +223,12 @@ func (c *Client) MatchExpectedIPs(domain string, ips []net.IP) ([]net.IP, error)
 		}
 	}
 	if len(newIps) == 0 {
+		if c.allowUnexpectedIPs {
+			return ips, nil
+		}
 		return nil, errExpectedIPNonMatch
 	}
-	errors.LogDebug(context.Background(), "domain ", domain, " expectIPs ", newIps, " matched at server ", c.Name())
+	errors.LogDebug(context.Background(), "domain ", domain, " expectedIPs ", newIps, " matched at server ", c.Name())
 	return newIps, nil
 }
 
